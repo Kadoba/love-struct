@@ -40,8 +40,8 @@ end
 
 ---------------------------------------------------------------------------------------------------
 -- Inserts a new value on top of the stack.
-function Stack:push(val)
-	if val ~= nil then 
+function Stack:push(...)
+	for k, val in pairs({...}) do
 		self._size = self._size + 1
 		self[self._size] = val
 	end

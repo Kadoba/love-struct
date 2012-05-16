@@ -42,20 +42,20 @@ end
 
 ---------------------------------------------------------------------------------------------------
 -- Pushes a value to the right of the queue
-function Queue:pushRight(value, value2, ...)
-	if value == nil then return end
-	self.right = self.right + 1
-	self.values[self.right] = value
-	if value2 ~= nil then self:pushRight(value2, ...) end
+function Queue:pushRight(...)
+	for k, value in pairs({...}) do
+		self.right = self.right + 1
+		self.values[self.right] = value
+	end
 end
 
 ---------------------------------------------------------------------------------------------------
 -- Pushes a value to the left of the queue
-function Queue:pushLeft(value, value2, ...)
-	if value == nil then return end
-	self.left = self.left - 1
-	self.values[self.left] = value
-	if value2 ~= nil then self:pushLeft(value2, ...) end
+function Queue:pushLeft(...)
+	for k, value in pairs({...}) do
+		self.left = self.left - 1
+		self.values[self.left] = value
+	end
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -98,10 +98,10 @@ Queue.peek = Queue.peekLeft
 
 ---------------------------------------------------------------------------------------------------
 -- Iterates over all values in the queue. By default, this pops and returns all values from left to 
--- right. The retain parameter can be set to true to prevent the iteration from removing values from 
--- the queue. The start parameter is the end of the queue to start the iteration from (either "left" 
--- or "right".) 
+-- right. The retain parameter can be set to true to prevent the iteration from removing values.
+-- The start parameter is the end of the queue to start the iteration from (either "left" or "right") 
 function Queue:iterate(retain, start)
+	if self:size() < 1 then return end
 	start = start or 'left'
 	local val = 0
 	if start~= 'left' and start ~= 'right' then
