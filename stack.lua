@@ -23,7 +23,7 @@ function Stack:copy()
 end
 
 ---------------------------------------------------------------------------------------------------
--- Copies and returns a new stack.
+-- Clears the stack of all values.
 function Stack:clear()
 	for k,v in pairs(self) do
 		self[k] = nil
@@ -64,7 +64,8 @@ function Stack:peek()
 end
 
 ---------------------------------------------------------------------------------------------------
--- Iterate over all elements. Set retain to true to keep the elements from being removed.
+-- Iterate over all values starting from the top. Set retain to true to keep the values from 
+-- being removed.
 function Stack:iterate(retain)
 	local i = self:size()
 	local count = 0
