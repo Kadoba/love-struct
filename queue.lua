@@ -1,153 +1,470 @@
 ---------------------------------------------------------------------------------------------------
--- queue.lua
+-- -= Loader =-
 ---------------------------------------------------------------------------------------------------
-local Queue = {}
-Queue.__index = Queue
 
----------------------------------------------------------------------------------------------------
--- Creates and returns a new queue
-function Queue:new()
-	local queue = {}
-	queue.values = {}
-	queue.left = 0
-	queue.right = -1
-	return setmetatable(queue,Queue)
+-- Decompresses gzip and zlib
+local decompress = require(TILED_LOADER_PATH .. "external/deflatelua")
+
+-- XML parser
+local xml = require(TILED_LOADER_PATH .. "external/xml")
+
+-- Base64 parser, Turns base64 strings into other data formats
+local base64 = require(TILED_LOADER_PATH .. "Base64")
+
+
+local Loader = {}
+
+local filename  -- The name of the tmx file
+local fullpath  -- The full path to the tmx file minus the name
+
+----------------------------------------------------------------------------------------------------
+
+local function split(txt, name)
+    local bundle = {}
+    local att
+    for attText, content in t:gmatch(string.format("<%s(.*)>(.*)</%s>", name, name) do
+        att = {}
+        for k,v in attText:gmatch('([^%s]+)="(.+)"') do
+            att[k] = v
+        end
+        bundle[#bundle+1] = {att, content}
+    end
+    return bundle
 end
 
----------------------------------------------------------------------------------------------------
--- Creates a copy of the queue
-function Queue:copy()
-	local queue = Queue:new()
-	for k,v in pairs(self.values) do
-		queue.values[k] = v
-	end
-	queue.left = self.left
-	queue.right = self.right
-	return queue
+----------------------------------------------------------------------------------------------------
+-- Loads a Map from a tmx file and returns it.
+function Loader.load(tofile)
+    
+    -- Process directory up
+    while string.find(fullpath, "[/\\][^/^\\]+[/\\]%.%.[/\\]") do
+        fullpath = string.gsub(fullpath, "[/\\][^/^\\]+[/\\]%.%.[/\\]", "/", 1)
+    end
+    
+    -- Get the file name
+    filename = string.match(fullpath, "[^/^\\]+$")
+    
+    -- Get the path to the file
+    fullpath = string.gsub(fullpath, "[^/^\\]+$", "")
+    
+    -- Find out if the file is in the game or save directory
+    if love.filesystem.exists(fullpath .. filename) then
+    elseif love.filesystem.exists(fullpath .. filename .. ".tmx") then
+        filename = filename .. ".tmx"
+    else
+        error("Loader.load() Could not find find the file in these locations:\n" ..
+            "\nGame Directory: " .. fullpath .. filename ..
+            "\nGame Directory: " .. fullpath .. filename .. ".tmx")
+    end
+    
+    -- Read the file and parse it into a table
+    local t = love.filesystem.read(fullpath .. filename)
+    
+    -- Get the map and expand it
+    for map in pairs(split(t, "map")) do
+        return Loader.expandMap(fullpath .. filename, map[1], map[2])
+    end
+    
+    -- If we made this this far then there wasn't a map tag
+    error("Loader.load - No map found in file " .. fullpath .. filename)
 end
 
----------------------------------------------------------------------------------------------------
--- Clears the queue
-function Queue:clear()
-	self.values = {}
-	self.left = 0
-	self.right = -1
+----------------------------------------------------------------------------------------------------
+-- Private
+----------------------------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------------
+-- Processes a properties table and returns it
+function Loader._expandProperties(att, content)
+
+    -- Do some checking
+    Loader._checkXML(t)
+    if t.label ~= "properties" then
+        error("Loader._expandProperties - Passed value is not a properties table")
+    end
+    
+    -- Create a properties table and populate it. Will attempt to convert the property to
+    -- the appropriate type.
+    local prop = {}
+    for _,v in pairs(t) do
+        Loader._checkXML(t)
+        if v.label == "property" then
+            if v.xarg.value == "true" then
+                prop[v.xarg.name] = true
+            elseif v.xarg.value == "false" then
+                prop[v.xarg.name] = false
+            else
+                prop[v.xarg.name] = tonumber(v.xarg.value) or v.xarg.value
+            end
+        end
+    end
+    
+    -- Return the properties
+    return prop
 end
 
----------------------------------------------------------------------------------------------------
--- Returns the size of the queue
-function Queue:size()
-	return self.right - self.left + 1
+----------------------------------------------------------------------------------------------------
+-- Process Map data from xml table
+function Loader._expandMap(name, t)
+    
+    -- Do some checking
+    Loader._checkXML(t)
+    assert(t.label == "map", "Loader._expandMap - Passed table is not a map")
+    assert(t.xarg.width, t.xarg.height, t.xarg.tilewidth, t.xarg.tileheight,
+           "Loader._expandMap - Map data is corrupt")
+
+    -- We'll use these for temporary storage
+    local map, tileset, tilelayer, objectlayer, props
+    local props = {}
+    
+    -- Get the properties
+    for _, v in ipairs(t) do
+        if v.label == "properties" then
+            props = Loader._expandProperties(v)
+        end
+    end
+    
+    -- Create the map from the settings
+    local map = Map:new(name, tonumber(t.xarg.width),tonumber(t.xarg.height), 
+                        tonumber(t.xarg.tilewidth), tonumber(t.xarg.tileheight), 
+                        t.xarg.orientation, props.atl_directory or fullpath, props)
+
+    -- Apply the loader settings if atl_useSpriteBatch or atl_drawObjects was not set
+    map.useSpriteBatch = map.useSpriteBatch == nil and Loader.useSpriteBatch or map.useSpriteBatch 
+    map.drawObjects = map.drawObjects == nil and  Loader.drawObjects or map.drawObjects
+    
+    -- Now we fill it with the content
+    for _, v in ipairs(t) do
+        
+        -- Process TileSet
+        if v.label == "tileset" then 
+            tileset = Loader._expandTileSet(v, map)
+            map.tilesets[tileset.name] = tileset
+            map:updateTiles()
+        end
+            
+        -- Process TileLayer
+        if v.label == "layer" then
+            tilelayer = Loader._expandTileLayer(v, map)
+            map.layers[tilelayer.name] = tilelayer
+            map.layerOrder[#map.layerOrder + 1] = tilelayer
+        end
+        
+        -- Process ObjectLayer
+        if v.label == "objectgroup" then
+            objectlayer = Loader._expandObjectLayer(v, map)
+            map.layers[objectlayer.name] = objectlayer
+            map.layerOrder[#map.layerOrder + 1] = objectlayer
+        end
+        
+        -- Process CustomLayer
+        if v.label == "customlayer" then
+            map:newCustomLayer(v.xarg.name)
+            for _, v2 in ipairs(v) do
+                if v2.label == "data" then
+                    map(v.xarg.name).data = v2[1]
+                end
+            end
+        end
+        
+    end
+    
+    -- Return our map
+    return map
 end
 
----------------------------------------------------------------------------------------------------
--- Pushes a value to the right of the queue
-function Queue:pushRight(...)
-	for k, value in pairs({...}) do
-		self.right = self.right + 1
-		self.values[self.right] = value
-	end
+----------------------------------------------------------------------------------------------------
+-- Process TileSet from xml table
+function Loader._expandTileSet(t, map)
+
+    -- Do some checking
+    Loader._checkXML(t)
+    assert(t.label == "tileset", "Loader._expandTileSet - Passed table is not a tileset")
+    
+    -- If the tileset is an external one then replace it as the tileset. The firstgid is 
+    -- stored in the tileset tag in the original file while the rest of the tileset information 
+    -- is stored in the external file.
+    if t.xarg.source then 
+        local gid = t.xarg.firstgid
+        t = love.filesystem.read(map._directory .. t.xarg.source)
+        for _,v in pairs(xml.string_to_table(t)) do if v.label == "tileset" then t = v end end
+        t.xarg.firstgid = gid
+    end
+    
+    if not t.xarg.name or not t.xarg.tilewidth or not t.xarg.tileheight or not t.xarg.firstgid then
+        error("Loader._expandTileSet - Tileset data is corrupt")
+    end
+
+    
+    -- Temporary storage
+    local image, imagePath, imageWidth, imageHeight, path, prop, tileSetProperties, trans
+    local tileProperties = {}
+    local offsetX, offsetY = 0, 0
+    
+    -- Process elements
+    for _, v in ipairs(t) do
+        -- Process image
+        if v.label == "image" then 
+            imagePath = v.xarg.source
+            path = map._directory .. v.xarg.source
+            -- Process directory up
+            while string.find(path, "[^/^\\]+[/\\]%.%.[/\\]") do
+                path = string.gsub(path, "[^/^\\]+[/\\]%.%.[/\\]", "", 1)
+            end
+            -- If the image is in the cache then load it
+            if cache[path] then
+                image = cache[path]
+                imageWidth = cache_imagesize[image].width
+                imageHeight = cache_imagesize[image].height
+            -- Else load it and store in the cache
+            else
+                image = love.image.newImageData(path) 
+                -- transparent color
+                if v.xarg.trans then
+                    trans = { tonumber( "0x" .. v.xarg.trans:sub(1,2) ), 
+                              tonumber( "0x" .. v.xarg.trans:sub(3,4) ), 
+                              tonumber( "0x" .. v.xarg.trans:sub(5,6) )}
+                    image:mapPixel( function(x,y,r,g,b,a)
+                    return r,g,b, (trans[1] == r and trans[2] == g and trans[3] ==b and 0) or a  end
+                    )
+                end
+                -- Set the image information
+                image, imageWidth, imageHeight = Loader._newImage(image)
+                image:setFilter(Loader.filterMin, Loader.filterMag)
+                -- Cache the created image
+                cache[path] = image
+                cache_imagesize[image] = {width = imageWidth, height = imageHeight}
+            end
+        end
+        
+        -- Process tile properties
+        if v.label == "tile" then 
+            for _, v2 in ipairs(v) do
+                if v2.label == "properties" then
+                    -- Store the property. We must increase the id the starting gid
+                    if not v.xarg.id then error(v.xarg.id) end
+                    tileProperties[v.xarg.id+t.xarg.firstgid] = Loader._expandProperties(v2)
+                end
+            end
+        end
+        
+        -- Process tile set properties
+        if v.label == "properties" then
+            tileSetProperties = Loader._expandProperties(v)
+        end
+        
+        -- Get the tile offset if there is one.
+        if v.label == "tileoffset" then
+            offsetX, offsetY = tonumber(v.xarg.x or 0), tonumber(v.xarg.y or 0)
+        end
+
+    end
+    
+    -- Make sure that an image was loaded
+    assert(image, "Loader._expandTileSet - Tileset did not contain an image")
+
+    -- Return the TileSet
+    local tileset = TileSet:new(image, imagePath, Loader._checkName(map.tilesets, t.xarg.name), 
+                       tonumber(t.xarg.tilewidth), tonumber(t.xarg.tileheight),
+                       tonumber(imageWidth), tonumber(imageHeight),
+                       tonumber(t.xarg.firstgid), tonumber(t.xarg.spacing), tonumber(t.xarg.margin),
+                       offsetX, offsetY, trans, tileProperties, tileSetProperties)
+    return tileset
 end
 
----------------------------------------------------------------------------------------------------
--- Pushes a value to the left of the queue
-function Queue:pushLeft(...)
-	for k, value in pairs({...}) do
-		self.left = self.left - 1
-		self.values[self.left] = value
-	end
+----------------------------------------------------------------------------------------------------
+-- Process TileLayer from xml table
+function Loader._expandTileLayer(t, map)
+
+    -- Do some checking
+    Loader._checkXML(t)
+    assert(t.label == "layer", "Loader._expandTileLayer - Passed table is not a tileset")
+    
+    -- Process elements
+    local data, properties
+    for _, v in ipairs(t) do
+        Loader._checkXML(t)
+        
+        -- Process data
+        if v.label == "data" then 
+            data = Loader._expandTileLayerData(v) 
+        end
+        
+        -- Process TileLayer properties
+        if v.label == "properties" then
+            properties = Loader._expandProperties(v)
+        end
+    end
+    
+    -- Create the new layer
+    local layer = TileLayer:new(map, t.xarg.name, t.xarg.opacity, properties)
+    
+    -- Set the visibility
+    layer.visible = not (t.xarg.visible == "0")
+    
+    -- Populate the tiles and return the layer
+    layer:_populate(data)
+    return layer
 end
 
----------------------------------------------------------------------------------------------------
--- Pops a value from the right of the queue
-function Queue:popRight()
-	if self.right < self.left then return nil end
-	local value = self.values[self.right]
-	self.values[self.right] = nil
-	self.right = self.right - 1
-	return value
+----------------------------------------------------------------------------------------------------
+-- Process TileLayer data from xml table
+function Loader._expandTileLayerData(t)
+
+    -- Do some checking
+    Loader._checkXML(t)
+    assert(t.label == "data", "Loader._expandTileLayerData - Passed table is not TileLayer data")
+    
+    local data = {}
+    
+    -- If encoded by comma seperated value (csv) then cut each value out and put it into a table.
+    if t.xarg.encoding == "csv" then
+            string.gsub(t[1], "[%-%d]+", function(a) data[#data+1] = tonumber(a) or 0 end)
+    end
+    
+    -- Base64 encoding. See base64.lua for more details.
+    if t.xarg.encoding == "base64" then
+    
+        -- If a compression method is used
+        if t.xarg.compression == "gzip" or t.xarg.compression == "zlib"  then
+            -- Select the appropriate function
+            local decomp = t.xarg.compression == "gzip" and decompress.gunzip or decompress.inflate_zlib
+            -- Decompress the string into bytes
+            local bytes = {}
+            decomp({input = base64.decode("string", t[1]), output = function(b) bytes[#bytes+1] = b end})
+            -- Glue the bytes into ints
+            for i=1,#bytes,4 do
+                data[#data+1] = base64.glueInt(bytes[i],bytes[i+1],bytes[i+2],bytes[i+3])
+            end
+        -- If there is no compression then just convert to ints
+        else
+            data = base64.decode("int", t[1])
+        end
+    end
+    
+    -- If there is no encoding then the file is probably saved as XML
+    if t.xarg.encoding == nil then
+        for k,v in ipairs(t) do
+            if v.label == "tile" then 
+                data[#data+1] = tonumber(v.xarg.gid)
+            end
+        end
+    end
+    
+    -- Return the data
+    return data
 end
 
----------------------------------------------------------------------------------------------------
--- Pops a value from the left of the queue
-function Queue:popLeft()
-	if self.right < self.left then return nil end
-	local value = self.values[self.left]
-	self.values[self.left] = nil
-	self.left = self.left + 1
-	return value
+----------------------------------------------------------------------------------------------------
+-- Process ObjectLayer from xml table
+function Loader._expandObjectLayer(t, map)
+
+    -- Do some checking
+    Loader._checkXML(t)
+    if t.label ~= "objectgroup" then
+        error("Loader._expandObjectLayer - Passed table is not ObjectLayer data")
+    end
+    
+    -- Tiled stores colors in hexidecimal format that looks like "#FFFFFF" 
+    -- We need go convert them into base 10 RGB format
+    if t.xarg.color == nil then t.xarg.color = "#000000" end
+    local color = { tonumber( "0x" .. t.xarg.color:sub(2,3) ), 
+                    tonumber( "0x" .. t.xarg.color:sub(4,5) ), 
+                    tonumber( "0x" .. t.xarg.color:sub(6,7) )}
+    
+    -- Create a new layer
+    local layer = ObjectLayer:new(map, Loader._checkName(map.layers, t.xarg.name), color, 
+                                  t.xarg.opacity)
+                    
+    -- Process elements
+    local objects = {}
+    local prop, obj, poly
+    for _, v in ipairs(t) do
+    
+        -- Process objects
+        local obj
+        if v.label == "object" then
+            obj = Object:new(layer, v.xarg.name, v.xarg.type, tonumber(v.xarg.x), 
+                                tonumber(v.xarg.y), tonumber(v.xarg.width), 
+                                tonumber(v.xarg.height), tonumber(v.xarg.gid) )
+            objects[#objects+1] = obj
+            for _, v2 in ipairs(v) do
+            
+                -- Process object properties
+                if v2.label == "properties" then 
+                    obj.properties = Loader._expandProperties(v2)
+                end
+                
+                -- Process polyline objects
+                local polylineFunct = function(a) 
+                    obj.polyline[#obj.polyline+1] = tonumber(a) or 0 
+                end
+                if v2.label == "polyline" then
+                    obj.polyline = {}
+                    string.gsub(v2.xarg.points, "[%-%d]+", polylineFunct)
+                end
+                
+                -- Process polyline objects
+                local polygonFunct = function(a) 
+                    obj.polygon[#obj.polygon+1] = tonumber(a) or 0 
+                end
+                if v2.label == "polygon" then
+                    obj.polygon = {}
+                    string.gsub(v2.xarg.points, "[%-%d]+", polygonFunct)
+                end
+            
+            end
+            obj:updateDrawInfo()
+        end
+        
+        -- Process properties
+        if v.label == "properties" then
+            prop = Loader._expandProperties(v)
+        end
+        
+    end
+    
+    -- Set the properties and object tables
+    layer.properties = prop or {}
+    layer.objects = objects
+    
+    -- Set the visibility
+    layer.visible = not (t.xarg.visible == "0")
+    
+    -- Return the layer
+    return layer
 end
 
----------------------------------------------------------------------------------------------------
--- Return the right value without removing it
-function Queue:peekRight()
-	return self.values[self.right]
-end	
 
----------------------------------------------------------------------------------------------------
--- Returns the left value without removing it
-function Queue:peekLeft()
-	return self.values[self.left]
-end	
+----------------------------------------------------------------------------------------------------
+-- Return the loader
+return Loader
 
----------------------------------------------------------------------------------------------------
--- Easier syntax for one-way queues
-Queue.push = Queue.pushRight
-Queue.pop = Queue.popLeft
-Queue.peek = Queue.peekLeft
 
----------------------------------------------------------------------------------------------------
--- Iterates over all values in the queue. By default, this pops and returns all values from left to 
--- right. The retain parameter can be set to true to prevent the iteration from removing values.
--- The start parameter is the end of the queue to start the iteration from (either "left" or "right") 
-function Queue:iterate(retain, start)
-	if self:size() < 1 then return end
-	start = start or 'left'
-	local val = 0
-	if start~= 'left' and start ~= 'right' then
-		error( string.format('Queue:iterate(start, retain) - Unknown starting end %s.' ..
-							 'Must be nil "right" or "left"', tostring(start)) )
-	end
-	if not retain then
-		if start == 'right' then
-			return function() 
-				if self.left < self.right then 
-					val = val+1 
-					return val, self:popRight() 
-				end 
-			end
-		else
-			return function() 
-				if self.left < self.right then 
-					val = val+1 
-					return val, self:popLeft() 
-				end 
-			end
-		end
-	else
-		local current = start == 'right' and self.right or self.left
-		local stop = start == 'right' and self.left or self.right
-		local step = start == 'right' and -1 or 1
-		stop = stop + step
-		return function() 
-			if current ~= stop then 
-				current = current + step
-				val = val + 1
-				return val, self.values[current - step] 
-			end 
-		end
-	end
-end
+--[[Copyright (c) 2011-2012 Casey Baxter
 
----------------------------------------------------------------------------------------------------
--- Returns the queue class
-return Queue
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
----------------------------------------------------------------------------------------------------
--- By Casey Baxter (Kadoba) Casey_Baxter@Hotmail.com, 2012
---
--- CC0 Public Domain Dedication 
--- To the extent possible under law, the author(s) have dedicated all copyright and related and 
--- neighboring rights to this software to the public domain worldwide. This software is distributed 
--- without any warranty. 
-----------------------------------------------------------------------------------------------------	
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+Except as contained in this notice, the name(s) of the above copyright holders
+shall not be used in advertising or otherwise to promote the sale, use or
+other dealings in this Software without prior written authorization.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.--]]
+
+
+
+
