@@ -13,7 +13,7 @@ function Bag:new(item, ...)
     bag.items = {}
     bag._size = 0
     if item then bag:insert(item, ...) end
-    return bad
+    return bag
 end
 
 ---------------------------------------------------------------------------------------------------
